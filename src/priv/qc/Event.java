@@ -34,22 +34,26 @@ public abstract class Event implements Runnable {
         this.delayMs = delayMs;
     }
 
-    int getDelayMs() {
+    public int getDelayMs() {
         return delayMs;
     }
 
     public long getNextTs() {
-        boolean scheduled = isScheduled();
-        long nextMs = TimeUtil.getTimeMillis();
-        if (scheduled) {
-            nextMs += future.getDelay(TimeUnit.MILLISECONDS);
-        }
+        long nextMs = TimeUtil.getTimeMillis() + getRemainingMs();
         return nextMs / 1000;
+    }
+
+    public long getRemainingMs() {
+        boolean scheduled = isScheduled();
+        if (scheduled) {
+            return Math.max(0, future.getDelay(TimeUnit.MILLISECONDS));
+        }
+        return 0;
     }
 
     public boolean isScheduled() {
         ScheduledFuture<?> f = future;
-        return f != null && !f.isDone();
+        return f != null && (!f.isDone() || worker.isNew());
     }
 
     @Override
@@ -62,20 +66,42 @@ public abstract class Event implements Runnable {
      * 可优化点：在Worker正常执行完成后，实例可是可复用的，可以将取消标记升级为 `(就绪|完成)&终止` 复合标记
      */
     private final class Worker implements Runnable {
+        
+        private static final int NEW = 0;
+        private static final int RUNNING = 1;
+        private static final int CANCELED = 2;
+
         /**
          * Worker的更新都是在EventThread单线程操作的
          */
-        private boolean canceled;
+        private int state;
 
         public Worker() {
-            this.canceled = false;
+            this.state = NEW;
+        }
+
+        public boolean isNew() {
+            return state == NEW;
+        }
+
+        public void cancel() {
+            state = CANCELED;
+        }
+
+        public boolean isCanceled() {
+            return state == CANCELED;
+        }
+
+        public void reset() {
+            state = NEW;
         }
 
         @Override
         public void run() {
-            if (canceled) {
+            if (isCanceled()) {
                 return;
             }
+            state = RUNNING;
             ScheduledFuture<?> f = future;
             if (f != null && f.isDone()) {
                 future = null;
@@ -89,37 +115,37 @@ public abstract class Event implements Runnable {
      */
     protected abstract void invoke();
 
-    public final void schedule() {
+    private void prepare() {
         cancel();
         if (worker == null) {
             worker = new Worker();
+        } else {
+            worker.reset();
         }
+    }
+
+    public final void schedule() {
+        prepare();
         future = EventThread.getInstance().schedule(this);
     }
 
     public final void schedulePeriodic() {
-        cancel();
-        if (worker == null) {
-            worker = new Worker();
-        }
+        prepare();
         future = EventThread.getInstance().schedulePeriodic(this);
     }
 
     public final void scheduleRepeated() {
-        cancel();
-        if (worker == null) {
-            worker = new Worker();
-        }
+        prepare();
         future = EventThread.getInstance().scheduleRepeated(this);
     }
 
-    public final void cancel() {
+    public void cancel() {
         ScheduledFuture<?> f = future;
         if (f != null) {
             future = null;
             if (!f.cancel(false)) {
-                // 取消失败，说明Worker正在被调度/已调度完成，直接标记已取消丢弃任务
-                worker.canceled = true;
+                // 取消失败，说明Worker正在被调度/已调度完成，直接标记已取消并丢弃任务
+                worker.cancel();
                 worker = null;
             }
         }
